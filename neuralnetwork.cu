@@ -8,6 +8,7 @@
 #include <numeric>
 #include <string>
 #include <fstream>
+#include "matrix.h"
 
 using namespace std;
 
@@ -27,10 +28,6 @@ static int rand_range(int min, int max) {
     return rand() % (max + 1 - min) + min;
 }
 
-// Returns a random float in [0, 1]
-static float rand_float() {
-    return (float) rand() / (float) RAND_MAX;
-}
 
 __device__ float sigmoid(float x) {
     return 1/(1+expf(x));
@@ -67,75 +64,23 @@ __global__ void output_error_kernel(const float* expected_outputs, const float* 
 
 
 struct NNParams {
-    uint seed = 1;
-    float learning_rate = 5-3;
-    int input_size = 3;
+    uint seed = 2;
+    float learning_rate = 5e-2;
+    int input_size = 784;
     int output_size = 1;
-    int nb_layer = 12;
+    int nb_layer = 5;
     int min_nodes_per_layer = 6;
     int max_nodes_per_layer = 12;
 } nnParams;
 
-struct Matrix {
-    vector<float> data;
-    int rows = 0, cols = 0;
-    float* d_data = nullptr;
 
-    Matrix() = default;
-
-    Matrix(const Matrix& mat) = delete;
-    Matrix& operator=(const Matrix& mat) = delete;
-
-    Matrix(Matrix&& mat) : data(std::move(mat.data)), rows(mat.rows), cols(mat.cols), d_data(std::exchange(mat.d_data, nullptr)) {
-    }
-
-    Matrix& operator=(Matrix&& mat) {
-        data = std::move(mat.data);
-        rows = mat.rows;
-        cols = mat.cols;
-        d_data = std::exchange(mat.d_data, nullptr);
-        return *this;
-    }
-
-    Matrix(int rows, int cols) : data(rows*cols), rows(rows), cols(cols) {}
-
-    static Matrix random(int rows, int cols) {
-        Matrix res(rows, cols);
-        for(int i = 0; i < rows  * cols; i++) {
-            res.data[i] = 2 * rand_float() - 1;
-        }
-        return res;
-    };
-
-    ~Matrix() {
-        if (d_data != nullptr) {
-            checkError(cudaFree(d_data));
-        }
-    }
-
-    void allocateOnDevice() {
-        if(d_data == nullptr) {
-            checkError(cudaMalloc(&d_data, rows * cols * sizeof(float)));
-        }
-    }
-
-    void copyToDevice() {
-        allocateOnDevice();
-        checkError(cudaMemcpy(d_data, (const void*) data.data(), rows * cols * sizeof(float), cudaMemcpyHostToDevice));
-    }
-
-    void copyFromDevice() {
-        if (d_data != nullptr) {
-            checkError(cudaMemcpy((void*) data.data(), d_data, rows * cols * sizeof(float), cudaMemcpyDeviceToHost));
-        }
-    }
-};
 
 struct TrainParams {
     Matrix training_set_inputs;
     Matrix training_set_outputs;
-    int number_of_training_iterations = 100000;
-    int freq = 10000;
+    int number_of_training_iterations = 100;
+    int freq = 1;
+    int batch_size = 128;
 } trainParams;
 
 struct Input{
@@ -180,6 +125,37 @@ void multiplyMatrices(const Matrix& a, const Matrix& b, Matrix& c, bool transpos
     //checkError(cudaStreamSynchronize(stream));
 }
 
+void multiplyMatricesBatched(const MatrixBatched& a, const MatrixBatched& b, MatrixBatched& c, bool transposeA, bool transposeB,
+    const cublasHandle_t& cublasHandle, const cudaStream_t& stream, float alpha = 1.0f, float beta = 0.0f){
+    // Parameters
+    cublasOperation_t transa = (transposeA ? CUBLAS_OP_T : CUBLAS_OP_N);
+    cublasOperation_t transb = (transposeB ? CUBLAS_OP_T : CUBLAS_OP_N);
+
+    int rowsA = (transposeA ? a.cols : a.rows), colsA = a.cols + a.rows - rowsA;
+    int rowsB = (transposeB ? b.cols : b.rows), colsB = b.cols + b.rows - rowsB;
+    
+    int m = rowsA;
+    int n = colsB;
+    int k = colsA;
+    
+    assert(a.count == b.count);
+    assert(a.count == c.count);
+    assert(colsA == rowsB);
+    assert(c.rows == rowsA);
+    assert(c.cols == colsB);
+   
+    int lda = a.rows; // rows of A
+    int ldb = b.rows; // rows of B
+    int ldc = c.rows;
+
+
+    // Multiply matrices
+    checkCublasError(cublasSgemmBatched(
+        cublasHandle, transa, transb, m, n, k, &alpha, a.d_descriptor, lda, b.d_descriptor, ldb, &beta, c.d_descriptor, ldc, a.count));
+
+    // checkError(cudaStreamSynchronize(stream));
+}
+
 __global__ void hello_world() {
     int i = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x;
     printf("Hello from the GPU, index %d\n", i);
@@ -197,6 +173,18 @@ void forward_pass(const Matrix& inputs, const vector<Matrix>& synaptic_weights, 
     }
 }
 
+void forward_pass_batched(const MatrixBatched& inputs, const vector<MatrixBatched>& synaptic_weights, vector<MatrixBatched>& network,const cublasHandle_t& cublasHandle, const cudaStream_t& stream) {
+    for(int i = 0; i < nnParams.nb_layer+1;i++) {
+        if(i == 0) {
+            multiplyMatricesBatched(inputs, synaptic_weights[i], network[i], true, false, cublasHandle, stream);
+            sigmoid_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(network[i].data_start, network[i].data_start, network[i].count * network[i].rows*network[i].cols);
+        } else {
+            multiplyMatricesBatched(network[i-1], synaptic_weights[i], network[i], false, false, cublasHandle, stream);
+            sigmoid_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(network[i].data_start, network[i].data_start, network[i].count * network[i].rows*network[i].cols);
+        }
+    }
+}
+
 void compute_errors(const vector<Matrix>& network, const Matrix& outputs, const vector<Matrix>& weights, 
     vector<Matrix>& errors, cublasHandle_t& cublasHandle, cudaStream_t& stream) {
     int output_index = errors.size() - 1;
@@ -205,6 +193,17 @@ void compute_errors(const vector<Matrix>& network, const Matrix& outputs, const 
     for (int i = output_index - 1; i >= 0; i--) {
         multiplyMatrices(errors[i + 1], weights[i + 1], errors[i], false, true, cublasHandle, stream);
         sigmoid_derivative_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(network[i].d_data, errors[i].d_data, errors[i].d_data, errors[i].rows * errors[i].cols);
+    }
+}
+
+void compute_errors_batched(const vector<MatrixBatched>& network, const MatrixBatched& outputs, const vector<MatrixBatched>& weights, 
+    vector<MatrixBatched>& errors, cublasHandle_t& cublasHandle, cudaStream_t& stream) {
+    int output_index = errors.size() - 1;
+    output_error_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(outputs.data_start, network[output_index].data_start, errors[output_index].data_start, outputs.count * outputs.rows * outputs.cols);
+    checkLastError();
+    for (int i = output_index - 1; i >= 0; i--) {
+        multiplyMatricesBatched(errors[i + 1], weights[i + 1], errors[i], false, true, cublasHandle, stream);
+        sigmoid_derivative_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(network[i].data_start, errors[i].data_start, errors[i].data_start, errors[i].count * errors[i].rows * errors[i].cols);
     }
 }
 
@@ -220,6 +219,40 @@ vector<Matrix> allocate_network(const vector<int>& layers, int number_of_inputs,
     res.back().allocateOnDevice();
 
     return res;
+}
+
+vector<MatrixBatched> allocate_network_batched(const vector<int>& layers, int number_of_inputs, int output_size, int concurrent_batches) {
+    vector<MatrixBatched> res;
+    res.reserve(layers.size() + 1);
+    for (int cols : layers) {
+        res.emplace_back(concurrent_batches, number_of_inputs, cols);
+    }
+
+    res.emplace_back(concurrent_batches, number_of_inputs, output_size);
+
+    return res;
+}
+
+vector<MatrixBatched> allocate_adjustments_batched(const vector<Matrix>& weights, int batch_size) {
+    vector<MatrixBatched> res;
+    res.reserve(weights.size());
+    for (const auto& weight : weights) {
+        res.emplace_back(batch_size, weight.rows, weight.cols);
+    }
+
+    return res;
+}
+Matrix allocate_reductions_matrices(const vector<Matrix>& weights) {
+    int max_size = 0;
+    for (const auto& weight : weights) {
+        max_size = max(max_size, weight.rows * weight.cols);
+    }
+
+    Matrix m(max_size, 1);
+    m.data = vector<float>(max_size, 1.0f);
+    m.copyToDevice();
+
+    return m;
 }
 
 void train(const TrainParams& trainParams, const NNParams& nnParams, const vector<int>& layers, vector<Matrix>& weights,
@@ -250,6 +283,90 @@ void train(const TrainParams& trainParams, const NNParams& nnParams, const vecto
     }
     
 }
+
+void batch_train(const TrainParams& trainParams, vector<Matrix>& weights, const vector<int>& layers, const Matrix& input, const Matrix& output, cublasHandle_t cublasHandle) {
+    vector<float> error_array;
+
+    MatrixBatched input_batched[2] = {MatrixBatched(trainParams.batch_size, input.cols, 1), MatrixBatched(trainParams.batch_size, input.cols, 1)};
+    MatrixBatched output_batched[2] = {MatrixBatched(trainParams.batch_size, 1, 1), MatrixBatched(trainParams.batch_size, 1, 1)};
+    cudaStream_t streams[2] = {NULL, NULL};
+    checkError(cudaStreamCreateWithFlags(&streams[0], cudaStreamNonBlocking));
+    checkError(cudaStreamCreateWithFlags(&streams[1], cudaStreamNonBlocking));
+
+    vector<MatrixBatched> network = allocate_network_batched(layers, 1, output.cols, trainParams.batch_size);
+    vector<MatrixBatched> errors = allocate_network_batched(layers, 1, output.cols, trainParams.batch_size);
+    vector<MatrixBatched> adjustments = allocate_adjustments_batched(weights, trainParams.batch_size);
+    Matrix reduction_matrix = allocate_reductions_matrices(weights);
+
+    vector<float> error_vector;
+
+    vector<MatrixBatched> weights_batched;
+    weights_batched.reserve(weights.size());
+    for(int i = 0; i < weights.size(); i++) {
+        weights_batched.emplace_back(weights[i], trainParams.batch_size);
+    }
+
+    if(input.rows < trainParams.batch_size) {
+        fprintf(stderr, "The number of examples must be at least equal to the size of a batch (must be at least %d, is %d)\n", 
+                trainParams.batch_size, input.rows);
+        return;
+    }
+
+    for(int iteration = 0; iteration < trainParams.number_of_training_iterations; iteration++) {
+        for(int dispatch = 0; dispatch < 2; dispatch++) {
+            input_batched[dispatch].copySubmatrix(input, dispatch*trainParams.batch_size, streams[dispatch]);
+            output_batched[dispatch].copySubmatrix(output, dispatch*trainParams.batch_size, streams[dispatch]);
+        }
+        for(int dispatch = 0; dispatch < (input.rows-1) / trainParams.batch_size + 1; dispatch++) {
+            int dp = dispatch % 2;
+            cublasSetStream(cublasHandle, streams[dp]);
+            forward_pass_batched(input_batched[dp], weights_batched, network, cublasHandle, streams[dp]);
+            compute_errors_batched(network, output_batched[dp], weights_batched, errors, cublasHandle, streams[dp]);
+
+            for (int i = 0; i < nnParams.nb_layer+1; i++) {
+                if (i == 0) {
+                    multiplyMatricesBatched(input_batched[dp], errors[i], adjustments[i], false, false, cublasHandle, streams[dp]);
+                } else {
+                    multiplyMatricesBatched(network[i - 1], errors[i], adjustments[i], true, false, cublasHandle, streams[dp]);
+                }
+            }
+
+            // Mean reduction
+            for (int i = 0; i < nnParams.nb_layer+1; i++) {
+                int m = weights[i].rows * weights[i].cols;
+                int n = 1;
+                int k = trainParams.batch_size;
+
+                int lda = m;
+                int ldb = k;
+                int ldc = m;
+
+                float alpha = nnParams.learning_rate / trainParams.batch_size;
+                float beta = 1.0f;
+
+                checkCublasError(cublasSgemm(
+                    cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, 
+                    adjustments[i].data_start, lda,
+                    reduction_matrix.d_data, ldb, &beta,
+                    weights[i].d_data, ldc
+                ));
+
+                // checkError(cudaStreamSynchronize(stream));
+            }
+
+            if (dispatch + 2 < (input.rows-1) / trainParams.batch_size + 1) {
+                input_batched[dp].copySubmatrix(input, (dispatch + 2)*trainParams.batch_size, streams[dp]);
+                output_batched[dp].copySubmatrix(output, (dispatch+2)*trainParams.batch_size, streams[dp]);
+            }
+        }
+
+        if (iteration % trainParams.freq == 0) {
+            errors[layers.size()].copyFromDevice(error_vector);
+            float mean = std::abs(std::accumulate(error_vector.begin(), error_vector.end(), 0.0f)) / error_vector.size();
+            printf("Err = %e\n", mean);
+        }
+    }
+ }
 
 
 Input readInput(const string path){
@@ -284,7 +401,7 @@ Input readInput(const string path){
     for(int i = 0;i<x_matrix.rows;i++){
         y_matrix.data[i] = y[i];
         for(int j = 0;j<x_matrix.cols;j++){
-            x_matrix.data[i+x_matrix.rows*j] = x_rowMajor[i][j];
+            x_matrix.data[j+x_matrix.cols*i] = x_rowMajor[i][j];
         }
     }
     file.close();
@@ -323,10 +440,10 @@ int main(int argc, char** argv) {
         synaptic_weights[i].copyToDevice();
     }
 
-    Input input = readInput("input.txt");
+    Input input = readInput("mnist.txt");
     input.x.copyToDevice();
     input.y.copyToDevice();
-    train(trainParams, nnParams, layers, synaptic_weights, input.x, input.y, cublasHandle, stream);
+    batch_train(trainParams, synaptic_weights, layers, input.x, input.y, cublasHandle);
 
     cudaDeviceSynchronize();
     cublasDestroy(cublasHandle);

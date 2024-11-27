@@ -8,5 +8,5 @@ clean:
 	rm -f $(EXE)
 
 
-%: %.cu
+%: %.cu matrix.h
 	nvcc -O3 -arch=sm_75 -o $@ $< -lcublas
