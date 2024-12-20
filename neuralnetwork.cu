@@ -6,8 +6,10 @@
 #include <vector>
 #include <cassert>
 #include <numeric>
+#include <algorithm>
 #include <string>
 #include <fstream>
+#include <sys/time.h>
 #include "matrix.h"
 
 using namespace std;
@@ -64,8 +66,8 @@ __global__ void output_error_kernel(const float* expected_outputs, const float* 
 
 
 struct NNParams {
-    uint seed = 2;
-    float learning_rate = 5e-2;
+    uint seed = 3;
+    float learning_rate = 0.001;
     int input_size = 784;
     int output_size = 1;
     int nb_layer = 5;
@@ -79,8 +81,8 @@ struct TrainParams {
     Matrix training_set_inputs;
     Matrix training_set_outputs;
     int number_of_training_iterations = 100;
-    int freq = 1;
-    int batch_size = 128;
+    int freq = 10;
+    int batch_size = 32;
 } trainParams;
 
 struct Input{
@@ -317,6 +319,8 @@ void batch_train(const TrainParams& trainParams, vector<Matrix>& weights, const 
             input_batched[dispatch].copySubmatrix(input, dispatch*trainParams.batch_size, streams[dispatch]);
             output_batched[dispatch].copySubmatrix(output, dispatch*trainParams.batch_size, streams[dispatch]);
         }
+        float err = 0;
+        int err_count = 0;
         for(int dispatch = 0; dispatch < (input.rows-1) / trainParams.batch_size + 1; dispatch++) {
             int dp = dispatch % 2;
             cublasSetStream(cublasHandle, streams[dp]);
@@ -358,12 +362,19 @@ void batch_train(const TrainParams& trainParams, vector<Matrix>& weights, const 
                 input_batched[dp].copySubmatrix(input, (dispatch + 2)*trainParams.batch_size, streams[dp]);
                 output_batched[dp].copySubmatrix(output, (dispatch+2)*trainParams.batch_size, streams[dp]);
             }
+
+            if (iteration % trainParams.freq == 0) {
+                errors[errors.size() - 1].copyFromDevice(error_vector, streams[dp]);
+                checkError(cudaStreamSynchronize(streams[dp]));
+                std::transform(error_vector.begin(), error_vector.end(), error_vector.begin(), [](auto x) { return 
+                    std::abs(x); });
+                err += std::accumulate(error_vector.begin(), error_vector.end(), 0.0f);
+                err_count += error_vector.size();
+            }
         }
 
         if (iteration % trainParams.freq == 0) {
-            errors[layers.size()].copyFromDevice(error_vector);
-            float mean = std::abs(std::accumulate(error_vector.begin(), error_vector.end(), 0.0f)) / error_vector.size();
-            printf("Err = %e\n", mean);
+            printf("Err = %e\n", err / err_count);
         }
     }
  }
@@ -441,9 +452,21 @@ int main(int argc, char** argv) {
     }
 
     Input input = readInput("mnist.txt");
-    input.x.copyToDevice();
-    input.y.copyToDevice();
+    // input.x.copyToDevice();
+    // input.y.copyToDevice();
+
+    struct timeval begin, end;
+
+    gettimeofday(&begin, NULL);
     batch_train(trainParams, synaptic_weights, layers, input.x, input.y, cublasHandle);
+    gettimeofday(&end, NULL);
+
+    // Calculate time.
+    double time = 1.0 * (end.tv_sec - begin.tv_sec) + 1.0e-6 * (end.tv_usec - begin.tv_usec);
+
+    double time_per_iter = time / trainParams.number_of_training_iterations; 
+    printf("Train time : %lfs (%les / iter)", time, time_per_iter);
+
 
     cudaDeviceSynchronize();
     cublasDestroy(cublasHandle);

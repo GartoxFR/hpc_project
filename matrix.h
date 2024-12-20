@@ -154,10 +154,10 @@ struct MatrixBatched {
         checkError(cudaMemcpyAsync(data_start, matrix.data.data() + start_row * rows, size * rows * sizeof(float), cudaMemcpyHostToDevice, stream));
     }
 
-    void copyFromDevice(vector<float>& dst) {
+    void copyFromDevice(vector<float>& dst, cudaStream_t stream) {
         dst.clear();
         dst.resize(count * rows * cols);
-        cudaMemcpy(dst.data(), data_start, count * rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(dst.data(), data_start, count * rows * cols * sizeof(float), cudaMemcpyDeviceToHost, stream);
     }
 
 };
